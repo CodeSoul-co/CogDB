@@ -306,16 +306,19 @@ func (s *EventSubscriber) drainWAL() error {
 		return nil
 	}
 	fromLSN := s.lastLSN.Load() + 1
-	entries, err := eventbackbone.ScanWAL(s.wal, fromLSN)
-	if err != nil {
-		return fmt.Errorf("scan WAL from LSN %d: %w", fromLSN, err)
-	}
 	s.boundaryMu.RLock()
 	visibleThrough := s.visibleThrough
 	s.boundaryMu.RUnlock()
 	visibleLSN := int64(0)
 	if visibleThrough != nil {
 		visibleLSN = visibleThrough()
+		if visibleLSN < fromLSN {
+			return nil
+		}
+	}
+	entries, err := eventbackbone.ScanWAL(s.wal, fromLSN)
+	if err != nil {
+		return fmt.Errorf("scan WAL from LSN %d: %w", fromLSN, err)
 	}
 	processed := 0
 	for _, entry := range entries {
