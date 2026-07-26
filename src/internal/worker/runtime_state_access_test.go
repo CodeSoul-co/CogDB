@@ -6,7 +6,35 @@ import (
 	"testing"
 
 	"plasmod/src/internal/schemas"
+	"plasmod/src/internal/semantic"
+	"plasmod/src/internal/storage"
 )
+
+type countingShareContractStore struct {
+	inner     storage.ShareContractStore
+	listCalls int
+}
+
+func newCountingShareContractStore() *countingShareContractStore {
+	return &countingShareContractStore{inner: storage.NewMemoryShareContractStore()}
+}
+
+func (s *countingShareContractStore) PutContract(c schemas.ShareContract) {
+	s.inner.PutContract(c)
+}
+
+func (s *countingShareContractStore) GetContract(id string) (schemas.ShareContract, bool) {
+	return s.inner.GetContract(id)
+}
+
+func (s *countingShareContractStore) ContractsByScope(scope string) []schemas.ShareContract {
+	return s.inner.ContractsByScope(scope)
+}
+
+func (s *countingShareContractStore) ListContracts() []schemas.ShareContract {
+	s.listCalls++
+	return s.inner.ListContracts()
+}
 
 func TestRuntimeStateMutationIsMonotonicAndReplayIdempotent(t *testing.T) {
 	runtime := buildTestRuntime(t)
@@ -74,6 +102,50 @@ func TestRuntimeQueryEnforcesCanonicalAccessAndReturnsDecision(t *testing.T) {
 	})
 	if len(allowed.Objects) != 1 || len(allowed.AccessDecisions) != 1 || allowed.AccessDecisions[0].Reason != "explicit_role_grant" {
 		t.Fatalf("role grant was not enforced or explained: %+v", allowed)
+	}
+}
+
+func TestRuntimeAccessFilterSkipsContractScanWhenObjectsHaveNoContract(t *testing.T) {
+	base := storage.NewMemoryRuntimeStorage()
+	contracts := newCountingShareContractStore()
+	store := storage.NewCompositeRuntimeStorage(
+		base.Segments(),
+		base.Indexes(),
+		base.Objects(),
+		base.Edges(),
+		base.Versions(),
+		base.Policies(),
+		contracts,
+		base.HotCache(),
+	)
+	runtime := &Runtime{
+		policy:       semantic.NewPolicyEngine(),
+		storage:      store,
+		capabilities: schemas.DefaultRuntimeCapabilities(),
+	}
+	memoryID := "mem_without_contract"
+	store.Objects().PutMemory(schemas.Memory{
+		MemoryID: memoryID,
+		AgentID:  "owner",
+		Content:  "public memory",
+		IsActive: true,
+		Access: schemas.CanonicalAccess{
+			OwnerAgentID: "owner",
+			Visibility:   string(schemas.VisibilityPublic),
+		},
+	})
+
+	allowed, decisions := runtime.filterObjectIDsByAccess(
+		schemas.QueryRequest{RequesterAgentID: "reader"},
+		[]string{memoryID},
+		0,
+	)
+
+	if len(allowed) != 1 || allowed[0] != memoryID || len(decisions) != 1 {
+		t.Fatalf("public memory should be allowed without a share contract: allowed=%v decisions=%v", allowed, decisions)
+	}
+	if contracts.listCalls != 0 {
+		t.Fatalf("ListContracts called %d times for access records without ShareContractID", contracts.listCalls)
 	}
 }
 

@@ -21,10 +21,7 @@ func (r *Runtime) filterObjectIDsByAccess(
 	readWatermarkLSN int64,
 ) ([]string, []schemas.AccessDecision) {
 	principal := r.accessPrincipal(req)
-	contracts := r.storage.Contracts().ListContracts()
-	if r.capabilities.GovernanceProfile == "no_share_contract" || r.capabilities.GovernanceProfile == "metadata_only" {
-		contracts = nil
-	}
+	contractsForAccess := r.contractsForAccess()
 	allowed := make([]string, 0, len(objectIDs))
 	decisions := make([]schemas.AccessDecision, 0, len(objectIDs))
 	seen := make(map[string]struct{}, len(objectIDs))
@@ -37,7 +34,7 @@ func (r *Runtime) filterObjectIDsByAccess(
 			continue
 		}
 		seen[objectID] = struct{}{}
-		decision, ok := r.objectAccessDecision(req, principal, contracts, objectID, readWatermarkLSN)
+		decision, ok := r.objectAccessDecision(req, principal, contractsForAccess, objectID, readWatermarkLSN)
 		if !ok {
 			continue
 		}
@@ -45,6 +42,26 @@ func (r *Runtime) filterObjectIDsByAccess(
 		decisions = append(decisions, decision)
 	}
 	return allowed, decisions
+}
+
+func (r *Runtime) contractsForAccess() func(schemas.CanonicalAccess) []schemas.ShareContract {
+	disabled := r == nil ||
+		r.storage == nil ||
+		r.storage.Contracts() == nil ||
+		r.capabilities.GovernanceProfile == "no_share_contract" ||
+		r.capabilities.GovernanceProfile == "metadata_only"
+	var contracts []schemas.ShareContract
+	loaded := false
+	return func(access schemas.CanonicalAccess) []schemas.ShareContract {
+		if disabled || strings.TrimSpace(access.ShareContractID) == "" {
+			return nil
+		}
+		if !loaded {
+			contracts = r.storage.Contracts().ListContracts()
+			loaded = true
+		}
+		return contracts
+	}
 }
 
 func (r *Runtime) accessPrincipal(req schemas.QueryRequest) semantic.AccessPrincipal {
@@ -71,7 +88,7 @@ func (r *Runtime) accessPrincipal(req schemas.QueryRequest) semantic.AccessPrinc
 func (r *Runtime) objectAccessDecision(
 	req schemas.QueryRequest,
 	principal semantic.AccessPrincipal,
-	contracts []schemas.ShareContract,
+	contractsForAccess func(schemas.CanonicalAccess) []schemas.ShareContract,
 	objectID string,
 	readWatermarkLSN int64,
 ) (schemas.AccessDecision, bool) {
@@ -101,6 +118,7 @@ func (r *Runtime) objectAccessDecision(
 	if r.capabilities.GovernanceProfile == "metadata_only" {
 		return metadataAccessDecision(record, principal, readWatermarkLSN)
 	}
+	contracts := contractsForAccess(record.access)
 	decision, allowed := r.policy.EvaluateAccess(
 		record.objectID,
 		record.ownerAgentID,
@@ -119,12 +137,13 @@ func (r *Runtime) objectAccessDecision(
 			if !endpoint.exists {
 				continue
 			}
+			endpointContracts := contractsForAccess(endpoint.access)
 			if _, endpointAllowed := r.policy.EvaluateAccess(
 				endpoint.objectID,
 				endpoint.ownerAgentID,
 				endpoint.access,
 				principal,
-				contracts,
+				endpointContracts,
 				endpoint.mutationLSN,
 				readWatermarkLSN,
 			); !endpointAllowed {
@@ -316,10 +335,7 @@ func (r *Runtime) filterResponseEvidenceByAccess(
 		return
 	}
 	principal := r.accessPrincipal(req)
-	contracts := r.storage.Contracts().ListContracts()
-	if r.capabilities.GovernanceProfile == "no_share_contract" || r.capabilities.GovernanceProfile == "metadata_only" {
-		contracts = nil
-	}
+	contractsForAccess := r.contractsForAccess()
 	allowedReference := func(objectID string) bool {
 		if strings.TrimSpace(objectID) == "" {
 			return true
@@ -328,7 +344,7 @@ func (r *Runtime) filterResponseEvidenceByAccess(
 		if !record.exists {
 			return true
 		}
-		_, allowed := r.objectAccessDecision(req, principal, contracts, objectID, readWatermarkLSN)
+		_, allowed := r.objectAccessDecision(req, principal, contractsForAccess, objectID, readWatermarkLSN)
 		return allowed
 	}
 
