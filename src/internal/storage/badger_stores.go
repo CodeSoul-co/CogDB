@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"log"
 	"time"
@@ -22,6 +23,9 @@ const (
 	kpObjArtifact = "obj|artifact|"
 	kpObjEvent    = "obj|event|"
 	kpObjUser     = "obj|user|"
+	kpMemAgentIdx = "idx|memory_agent|"
+	kpMemScopeIdx = "idx|memory_scope|"
+	kpMemSessIdx  = "idx|memory_session|"
 	kpEdge        = "edg|"
 	kpVer         = "ver|"
 	kpPol         = "pol|"
@@ -186,7 +190,35 @@ func (s *badgerObjectStore) ListSessions(agentID string) []schemas.Session {
 }
 
 func (s *badgerObjectStore) PutMemory(obj schemas.Memory) {
-	_ = badgerSetJSONCounted(s.db, []byte(kpObjMemory+obj.MemoryID), kpObjMemory, obj)
+	key := []byte(kpObjMemory + obj.MemoryID)
+	b, err := json.Marshal(obj)
+	if err != nil {
+		log.Printf("[badger] marshal json failed key=%q err=%v", string(key), err)
+		return
+	}
+	_ = s.db.Update(func(txn *badger.Txn) error {
+		var previous schemas.Memory
+		exists := false
+		item, err := txn.Get(key)
+		if err == nil {
+			exists = true
+			_ = item.Value(func(val []byte) error {
+				return json.Unmarshal(val, &previous)
+			})
+			deleteMemoryIndexTxn(txn, previous)
+		} else if err != badger.ErrKeyNotFound {
+			return err
+		}
+		if err := txn.Set(key, b); err != nil {
+			log.Printf("[badger] txn.Set failed key=%q err=%v", string(key), err)
+			return err
+		}
+		putMemoryIndexTxn(txn, obj, key)
+		if !exists {
+			return badgerAddCounterTxn(txn, kpObjMemory, 1)
+		}
+		return nil
+	})
 }
 func (s *badgerObjectStore) GetMemory(id string) (schemas.Memory, bool) {
 	var o schemas.Memory
@@ -195,10 +227,33 @@ func (s *badgerObjectStore) GetMemory(id string) (schemas.Memory, bool) {
 }
 
 func (s *badgerObjectStore) DeleteMemory(id string) {
-	_ = badgerDeleteCounted(s.db, []byte(kpObjMemory+id), kpObjMemory)
+	key := []byte(kpObjMemory + id)
+	_ = s.db.Update(func(txn *badger.Txn) error {
+		item, err := txn.Get(key)
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var previous schemas.Memory
+		_ = item.Value(func(val []byte) error {
+			return json.Unmarshal(val, &previous)
+		})
+		deleteMemoryIndexTxn(txn, previous)
+		if err := txn.Delete(key); err != nil {
+			return err
+		}
+		return badgerAddCounterTxn(txn, kpObjMemory, -1)
+	})
 }
 
 func (s *badgerObjectStore) ListMemories(agentID, sessionID string) []schemas.Memory {
+	if agentID != "" || sessionID != "" {
+		if indexed := s.listMemoriesByScopeIndex(agentID, sessionID); len(indexed) > 0 {
+			return indexed
+		}
+	}
 	all := listByPrefix[schemas.Memory](s.db, kpObjMemory)
 	out := make([]schemas.Memory, 0)
 	for _, v := range all {
@@ -208,6 +263,95 @@ func (s *badgerObjectStore) ListMemories(agentID, sessionID string) []schemas.Me
 		}
 	}
 	return out
+}
+
+func (s *badgerObjectStore) listMemoriesByScopeIndex(agentID, sessionID string) []schemas.Memory {
+	var prefix []byte
+	switch {
+	case agentID != "" && sessionID != "":
+		prefix = memoryScopeIndexPrefix(kpMemScopeIdx, agentID, sessionID)
+	case agentID != "":
+		prefix = memoryScopeIndexPrefix(kpMemAgentIdx, agentID, "")
+	case sessionID != "":
+		prefix = memoryScopeIndexPrefix(kpMemSessIdx, sessionID, "")
+	default:
+		return nil
+	}
+	out := make([]schemas.Memory, 0)
+	err := s.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
+			if err := item.Value(func(val []byte) error {
+				target, err := txn.Get(val)
+				if err == badger.ErrKeyNotFound {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				return target.Value(func(raw []byte) error {
+					var memory schemas.Memory
+					if err := json.Unmarshal(raw, &memory); err != nil {
+						return err
+					}
+					out = append(out, memory)
+					return nil
+				})
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("[badger] memory scope index lookup failed prefix=%q err=%v", string(prefix), err)
+		return nil
+	}
+	return out
+}
+
+func putMemoryIndexTxn(txn *badger.Txn, memory schemas.Memory, primaryKey []byte) {
+	indexes := memoryIndexKeys(memory)
+	for _, indexKey := range indexes {
+		_ = txn.Set(indexKey, primaryKey)
+	}
+}
+
+func deleteMemoryIndexTxn(txn *badger.Txn, memory schemas.Memory) {
+	for _, indexKey := range memoryIndexKeys(memory) {
+		_ = txn.Delete(indexKey)
+	}
+}
+
+func memoryIndexKeys(memory schemas.Memory) [][]byte {
+	if memory.MemoryID == "" {
+		return nil
+	}
+	keys := make([][]byte, 0, 3)
+	if memory.AgentID != "" {
+		keys = append(keys, append(memoryScopeIndexPrefix(kpMemAgentIdx, memory.AgentID, ""), memory.MemoryID...))
+	}
+	if memory.SessionID != "" {
+		keys = append(keys, append(memoryScopeIndexPrefix(kpMemSessIdx, memory.SessionID, ""), memory.MemoryID...))
+	}
+	if memory.AgentID != "" && memory.SessionID != "" {
+		keys = append(keys, append(memoryScopeIndexPrefix(kpMemScopeIdx, memory.AgentID, memory.SessionID), memory.MemoryID...))
+	}
+	return keys
+}
+
+func memoryScopeIndexPrefix(prefix, first, second string) []byte {
+	encoded := prefix + memoryIndexComponent(first) + "|"
+	if second != "" {
+		encoded += memoryIndexComponent(second) + "|"
+	}
+	return []byte(encoded)
+}
+
+func memoryIndexComponent(value string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(value))
 }
 
 func (s *badgerObjectStore) CountMemories(agentID, sessionID string) int {

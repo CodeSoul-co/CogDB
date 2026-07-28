@@ -65,9 +65,21 @@ func applyBadgerCanonicalProjection(db *badger.DB, projection CanonicalProjectio
 			}
 		}
 		if projection.Memory != nil {
-			if err := setJSONCountedTxn(txn, []byte(kpObjMemory+projection.Memory.MemoryID), kpObjMemory, *projection.Memory); err != nil {
+			memoryKey := []byte(kpObjMemory + projection.Memory.MemoryID)
+			var previous schemas.Memory
+			item, err := txn.Get(memoryKey)
+			if err == nil {
+				_ = item.Value(func(val []byte) error {
+					return json.Unmarshal(val, &previous)
+				})
+				deleteMemoryIndexTxn(txn, previous)
+			} else if err != badger.ErrKeyNotFound {
+				return fmt.Errorf("read memory %q: %w", projection.Memory.MemoryID, err)
+			}
+			if err := setJSONCountedTxn(txn, memoryKey, kpObjMemory, *projection.Memory); err != nil {
 				return fmt.Errorf("persist memory %q: %w", projection.Memory.MemoryID, err)
 			}
+			putMemoryIndexTxn(txn, *projection.Memory, memoryKey)
 		}
 		if projection.State != nil {
 			if err := setJSONCountedTxn(txn, []byte(kpObjState+projection.State.StateID), kpObjState, *projection.State); err != nil {
