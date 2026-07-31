@@ -345,4 +345,8 @@ Plasmod is licensed under the [MIT License](LICENSE).
 
 **[GitHub](https://github.com/CodeSoul-co/Plasmod)** · **[Python SDK](https://github.com/CodeSoul-co/pyplasmod)** · **[Docker Hub](https://hub.docker.com/r/oneflybird/plasmod)** · **[Issues](https://github.com/CodeSoul-co/Plasmod/issues)**
 
+## Contact us
+
+Email:duanzhenke@code-soul.com 
+
 </div>
