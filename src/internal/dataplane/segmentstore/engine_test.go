@@ -1,6 +1,9 @@
 package segmentstore
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestIndex_InsertAndSearch(t *testing.T) {
 	idx := NewIndex()
@@ -78,6 +81,41 @@ func TestIndex_InsertObjectKeepsNamespacesIndependent(t *testing.T) {
 		})
 		if len(got.Hits) != 1 || got.Hits[0].ObjectID != "obj" {
 			t.Fatalf("namespace %q lost its object: %+v", namespace, got.Hits)
+		}
+	}
+}
+
+func TestIndex_SearchAppliesScopeFiltersBeforeTopK(t *testing.T) {
+	idx := NewIndex()
+	for i := 0; i < 10; i++ {
+		sessionID := "session-a"
+		text := "scope selector exact match"
+		if i >= 8 {
+			sessionID = "session-b"
+			text = "scope selector partial"
+		}
+		idx.InsertObject(
+			fmt.Sprintf("mem_%02d", i),
+			text,
+			map[string]string{"session_id": sessionID},
+			"workspace",
+			0,
+		)
+	}
+
+	result := idx.Search(SearchRequest{
+		Query:            "scope selector exact match",
+		TopK:             5,
+		Namespace:        "workspace",
+		AttributeFilters: map[string]string{"session_id": "session-b"},
+		IncludeGrowing:   true,
+	})
+	if len(result.Hits) != 2 {
+		t.Fatalf("expected both lower-ranked in-scope hits, got %+v", result.Hits)
+	}
+	for _, hit := range result.Hits {
+		if hit.ObjectID != "mem_08" && hit.ObjectID != "mem_09" {
+			t.Fatalf("unexpected cross-session hit: %+v", hit)
 		}
 	}
 }

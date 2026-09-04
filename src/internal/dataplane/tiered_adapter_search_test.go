@@ -153,6 +153,49 @@ func TestTieredDataPlane_Search_IncludeColdFallsBackToLexicalWhenNoEmbedder(t *t
 	}
 }
 
+func TestTieredDataPlane_Search_ColdScopeFilterPrecedesTopK(t *testing.T) {
+	cold := storage.NewInMemoryColdStore()
+	for i := 0; i < 10; i++ {
+		sessionID := "session-a"
+		version := int64(100 - i)
+		if i >= 8 {
+			sessionID = "session-b"
+			version = int64(i)
+		}
+		cold.PutMemory(schemas.Memory{
+			MemoryID:    fmt.Sprintf("mem_cold_scope_%02d", i),
+			TenantID:    "tenant",
+			WorkspaceID: "workspace",
+			AgentID:     "agent",
+			SessionID:   sessionID,
+			Content:     "cold scope selector",
+			Version:     version,
+		})
+	}
+
+	objects := storage.NewTieredObjectStore(storage.NewHotObjectCache(100), nil, nil, cold)
+	plane := NewTieredDataPlane(objects)
+	out := plane.Search(SearchInput{
+		QueryText:   "cold scope selector",
+		TopK:        5,
+		IncludeCold: true,
+		ScopeFilters: map[string]string{
+			"tenant_id":    "tenant",
+			"workspace_id": "workspace",
+			"agent_id":     "agent",
+			"session_id":   "session-b",
+		},
+	})
+	if len(out.ObjectIDs) != 2 {
+		t.Fatalf("expected both lower-ranked scoped cold candidates, got %v", out.ObjectIDs)
+	}
+	for _, id := range out.ObjectIDs {
+		if id != "mem_cold_scope_08" && id != "mem_cold_scope_09" {
+			t.Fatalf("unexpected cross-session cold hit %q", id)
+		}
+	}
+}
+
 func TestTieredDataPlane_Search_IncludeColdWhenHotSatisfiesTopK_UsesVectorSearch(t *testing.T) {
 	embedder := &fakeQueryEmbedder{
 		vec: []float32{1, 0},

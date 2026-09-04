@@ -467,6 +467,133 @@ func TestRuntime_ExecuteQuery_FilterByImportBatchID(t *testing.T) {
 	}
 }
 
+func TestRuntime_ExecuteQuery_ScopeSelectorsAreStrict(t *testing.T) {
+	r := buildTestRuntime(t)
+	for i := 0; i < 10; i++ {
+		sessionID := "session-a"
+		text := fmt.Sprintf("scope selector exact match %02d", i)
+		if i >= 8 {
+			sessionID = "session-b"
+			text = fmt.Sprintf("scope selector partial %02d", i)
+		}
+		if _, err := r.SubmitIngest(schemas.Event{
+			EventID:     fmt.Sprintf("evt_scope_%02d", i),
+			TenantID:    "tenant-scope",
+			WorkspaceID: "workspace-scope",
+			AgentID:     "agent-scope",
+			SessionID:   sessionID,
+			Visibility:  "workspace",
+			Payload:     map[string]any{"text": text},
+		}); err != nil {
+			t.Fatalf("SubmitIngest failed: %v", err)
+		}
+	}
+	for _, ev := range []schemas.Event{
+		{
+			EventID: "evt_scope_other_agent", TenantID: "tenant-scope", WorkspaceID: "workspace-scope",
+			AgentID: "agent-other", SessionID: "session-b", Visibility: "workspace",
+			Payload: map[string]any{"text": "scope selector exact match other agent"},
+		},
+		{
+			EventID: "evt_scope_other_tenant", TenantID: "tenant-other", WorkspaceID: "workspace-scope",
+			AgentID: "agent-scope", SessionID: "session-b", Visibility: "workspace",
+			Payload: map[string]any{"text": "scope selector exact match other tenant"},
+		},
+		{
+			EventID: "evt_scope_other_workspace", TenantID: "tenant-scope", WorkspaceID: "workspace-other",
+			AgentID: "agent-scope", SessionID: "session-b", Visibility: "workspace",
+			Payload: map[string]any{"text": "scope selector exact match other workspace"},
+		},
+	} {
+		if _, err := r.SubmitIngest(ev); err != nil {
+			t.Fatalf("SubmitIngest distractor failed: %v", err)
+		}
+	}
+
+	query := func(sessionID string, topK int) schemas.QueryResponse {
+		return r.ExecuteQuery(schemas.QueryRequest{
+			QueryText:        "scope selector exact match",
+			TenantID:         "tenant-scope",
+			WorkspaceID:      "workspace-scope",
+			AgentID:          "agent-scope",
+			SessionID:        sessionID,
+			RequesterAgentID: "agent-scope",
+			TopK:             topK,
+		})
+	}
+
+	selected := query("session-b", 5)
+	if len(selected.Objects) != 2 {
+		t.Fatalf("expected both session-b candidates after pre-top_k scope filtering, got %v", selected.Objects)
+	}
+	for _, id := range selected.Objects {
+		mem, ok := r.storage.Objects().GetMemory(id)
+		if !ok || mem.SessionID != "session-b" {
+			t.Fatalf("explicit session selector returned cross-session object %q: %+v", id, mem)
+		}
+	}
+
+	unused := query("session-unused", 5)
+	if len(unused.Objects) != 0 {
+		t.Fatalf("expected unused session selector to return no objects, got %v", unused.Objects)
+	}
+
+	unscoped := query("", 20)
+	seenSessions := map[string]bool{}
+	for _, id := range unscoped.Objects {
+		if mem, ok := r.storage.Objects().GetMemory(id); ok {
+			seenSessions[mem.SessionID] = true
+		}
+	}
+	if !seenSessions["session-a"] || !seenSessions["session-b"] {
+		t.Fatalf("omitting session_id should preserve cross-session agent retrieval, got sessions=%v objects=%v", seenSessions, unscoped.Objects)
+	}
+
+	targeted := r.ExecuteQuery(schemas.QueryRequest{
+		QueryText:        "scope selector",
+		TenantID:         "tenant-scope",
+		WorkspaceID:      "workspace-scope",
+		AgentID:          "agent-scope",
+		SessionID:        "session-b",
+		RequesterAgentID: "agent-scope",
+		TopK:             5,
+		ResponseMode:     schemas.ResponseModeObjectsOnly,
+		TargetObjectIDs:  []string{"mem_evt_scope_00", "mem_evt_scope_08"},
+	})
+	if len(targeted.Objects) != 1 || targeted.Objects[0] != "mem_evt_scope_08" {
+		t.Fatalf("target_object_ids must obey the same session selector, got %v", targeted.Objects)
+	}
+}
+
+func TestMemoryMatchesScopeSelectors_AllDimensions(t *testing.T) {
+	mem := schemas.Memory{
+		TenantID:    "tenant-a",
+		WorkspaceID: "workspace-a",
+		Scope:       "workspace-a",
+		AgentID:     "agent-a",
+		SessionID:   "session-a",
+	}
+	tests := []struct {
+		name string
+		req  schemas.QueryRequest
+		want bool
+	}{
+		{name: "all matching", req: schemas.QueryRequest{TenantID: "tenant-a", WorkspaceID: "workspace-a", AgentID: "agent-a", SessionID: "session-a"}, want: true},
+		{name: "tenant mismatch", req: schemas.QueryRequest{TenantID: "tenant-b"}, want: false},
+		{name: "workspace mismatch", req: schemas.QueryRequest{WorkspaceID: "workspace-b"}, want: false},
+		{name: "agent mismatch", req: schemas.QueryRequest{AgentID: "agent-b"}, want: false},
+		{name: "session mismatch", req: schemas.QueryRequest{SessionID: "session-b"}, want: false},
+		{name: "session omitted", req: schemas.QueryRequest{TenantID: "tenant-a", WorkspaceID: "workspace-a", AgentID: "agent-a"}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := memoryMatchesScopeSelectors(mem, tt.req); got != tt.want {
+				t.Fatalf("memoryMatchesScopeSelectors() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRuntime_ExecuteQuery_LatestBatchOnly(t *testing.T) {
 	r := buildTestRuntime(t)
 	events := []schemas.Event{

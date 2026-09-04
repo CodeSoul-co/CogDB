@@ -33,6 +33,8 @@ type SegmentDataPlane struct {
 	rrfK        int
 	segMu       sync.RWMutex
 	segments    map[string][]string
+	attrsMu     sync.RWMutex
+	objectAttrs map[string]map[string]string
 }
 
 // NewSegmentDataPlane creates a SegmentDataPlane that performs only lexical search.
@@ -51,6 +53,7 @@ func NewSegmentDataPlaneWithConfig(cfg schemas.AlgorithmConfig) *SegmentDataPlan
 		sparseStore: sparseStore,
 		rrfK:        normalizeRRFK(cfg),
 		segments:    map[string][]string{},
+		objectAttrs: map[string]map[string]string{},
 	}
 }
 
@@ -81,6 +84,7 @@ func NewSegmentDataPlaneWithEmbedderAndConfig(embedder EmbeddingGenerator, cfg s
 		embedder:    embedder,
 		rrfK:        normalizeRRFK(cfg),
 		segments:    map[string][]string{},
+		objectAttrs: map[string]map[string]string{},
 	}, nil
 }
 
@@ -156,6 +160,7 @@ func (p *SegmentDataPlane) Ingest(record IngestRecord) error {
 		namespace = "default"
 	}
 	p.index.InsertObject(record.ObjectID, record.Text, record.Attributes, namespace, record.EventUnixTS)
+	p.rememberAttributes(record.ObjectID, record.Attributes)
 
 	if !record.SkipVectorIndex && p.vecStore != nil {
 		if len(record.Embedding) > 0 {
@@ -182,6 +187,7 @@ func (p *SegmentDataPlane) BatchIngest(records []IngestRecord) error {
 			records[i].Namespace = "default"
 		}
 		p.index.InsertObject(records[i].ObjectID, records[i].Text, records[i].Attributes, records[i].Namespace, records[i].EventUnixTS)
+		p.rememberAttributes(records[i].ObjectID, records[i].Attributes)
 	}
 
 	if p.vecStore != nil && p.embedder != nil {
@@ -231,14 +237,16 @@ func (p *SegmentDataPlane) BatchIngest(records []IngestRecord) error {
 // Channels that are not ready (CGO unavailable, no docs, no embedder, etc.)
 // are silently skipped, and Tier reflects the channels that contributed.
 func (p *SegmentDataPlane) Search(input SearchInput) SearchOutput {
+	allowedObjectIDs := p.allowedObjectIDs(input.ScopeFilters)
 	// ── Lexical search (always available) ─────────────────────────────────────
 	lexResult := p.index.Search(segmentstore.SearchRequest{
-		Query:          input.QueryText,
-		TopK:           input.TopK,
-		Namespace:      input.Namespace,
-		MinEventUnixTS: input.TimeFromUnixTS,
-		MaxEventUnixTS: input.TimeToUnixTS,
-		IncludeGrowing: input.IncludeGrowing,
+		Query:            input.QueryText,
+		TopK:             input.TopK,
+		Namespace:        input.Namespace,
+		AttributeFilters: input.ScopeFilters,
+		MinEventUnixTS:   input.TimeFromUnixTS,
+		MaxEventUnixTS:   input.TimeToUnixTS,
+		IncludeGrowing:   input.IncludeGrowing,
 	})
 
 	lexIDs := make([]string, 0, len(lexResult.Hits))
@@ -269,7 +277,7 @@ func (p *SegmentDataPlane) Search(input SearchInput) SearchOutput {
 		}
 
 		if len(queryVec) > 0 {
-			if ids, _, err := p.vecStore.Search(queryVec, input.TopK); err == nil && len(ids) > 0 {
+			if ids, _, err := p.vecStore.SearchFiltered(queryVec, input.TopK, allowedObjectIDs); err == nil && len(ids) > 0 {
 				vecIDs = ids
 			}
 		}
@@ -278,7 +286,7 @@ func (p *SegmentDataPlane) Search(input SearchInput) SearchOutput {
 	// ── Sparse / BM25-style search (optional) ─────────────────────────────────
 	sparseIDs := []string{}
 	if p.sparseStore != nil && p.sparseStore.Ready() {
-		if ids, _, err := p.sparseStore.Search(input.QueryText, input.TopK); err == nil && len(ids) > 0 {
+		if ids, _, err := p.sparseStore.SearchFiltered(input.QueryText, input.TopK, allowedObjectIDs); err == nil && len(ids) > 0 {
 			sparseIDs = ids
 		}
 	}
@@ -329,6 +337,38 @@ func (p *SegmentDataPlane) Search(input SearchInput) SearchOutput {
 		PlannedSegments: lexOut.PlannedSegments,
 		Tier:            joinChannels(names),
 	}
+}
+
+func (p *SegmentDataPlane) rememberAttributes(objectID string, attrs map[string]string) {
+	cloned := make(map[string]string, len(attrs))
+	for key, value := range attrs {
+		cloned[key] = value
+	}
+	p.attrsMu.Lock()
+	p.objectAttrs[objectID] = cloned
+	p.attrsMu.Unlock()
+}
+
+func (p *SegmentDataPlane) allowedObjectIDs(filters map[string]string) map[string]struct{} {
+	if len(filters) == 0 {
+		return nil
+	}
+	allowed := make(map[string]struct{})
+	p.attrsMu.RLock()
+	defer p.attrsMu.RUnlock()
+	for id, attrs := range p.objectAttrs {
+		matched := true
+		for key, expected := range filters {
+			if attrs[key] != expected {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			allowed[id] = struct{}{}
+		}
+	}
+	return allowed
 }
 
 // joinChannels formats the list of contributing channels into a stable

@@ -6,12 +6,13 @@ import (
 )
 
 type SearchRequest struct {
-	Query          string
-	TopK           int
-	Namespace      string
-	MinEventUnixTS int64
-	MaxEventUnixTS int64
-	IncludeGrowing bool
+	Query            string
+	TopK             int
+	Namespace        string
+	AttributeFilters map[string]string
+	MinEventUnixTS   int64
+	MaxEventUnixTS   int64
+	IncludeGrowing   bool
 }
 
 // SearchHit is a single result returned by the Searcher.
@@ -23,9 +24,9 @@ type SearchHit struct {
 
 // SearchResult is the full output of a search execution over one or more Shards.
 type SearchResult struct {
-	Hits         []SearchHit
+	Hits          []SearchHit
 	ScannedShards []string
-	ShardMetas   []ShardMeta
+	ShardMetas    []ShardMeta
 }
 
 // Searcher executes a simple lexical scan over planned partitions.
@@ -47,6 +48,9 @@ func (s *Searcher) Execute(req SearchRequest, plan Plan) SearchResult {
 	for _, shard := range plan.CandidateShards {
 		scanned.Insert(shard.ID)
 		for _, rec := range shard.SnapshotRecords() {
+			if !matchesAttributeFilters(rec.Attrs, req.AttributeFilters) {
+				continue
+			}
 			if req.MinEventUnixTS > 0 && rec.EventUnixTS > 0 && rec.EventUnixTS < req.MinEventUnixTS {
 				continue
 			}
@@ -69,6 +73,15 @@ func (s *Searcher) Execute(req SearchRequest, plan Plan) SearchResult {
 	}
 
 	return SearchResult{Hits: hits, ScannedShards: scanned.Collect(), ShardMetas: plan.ShardMetas}
+}
+
+func matchesAttributeFilters(attrs, filters map[string]string) bool {
+	for key, expected := range filters {
+		if attrs[key] != expected {
+			return false
+		}
+	}
+	return true
 }
 
 func lexicalScore(query string, text string) float64 {
