@@ -175,6 +175,13 @@ func (s *SparseStore) Build() error {
 //
 // Thread-safe.
 func (s *SparseStore) Search(queryText string, topK int) (ids []string, scores []float32, err error) {
+	return s.SearchFiltered(queryText, topK, nil)
+}
+
+// SearchFiltered applies an object-ID allow-list inside sparse retrieval,
+// before TopK is selected. The underlying sparse API accepts a ban-list, so
+// this method converts the allow-list to its inverse bitset.
+func (s *SparseStore) SearchFiltered(queryText string, topK int, allowedObjectIDs map[string]struct{}) (ids []string, scores []float32, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -185,7 +192,19 @@ func (s *SparseStore) Search(queryText string, topK int) (ids []string, scores [
 	if err != nil || len(q.Indices) == 0 {
 		return nil, nil, err
 	}
-	intIDs, floatScores, err := s.retriever.Search(q, topK, nil)
+	var banList []byte
+	if allowedObjectIDs != nil {
+		if len(allowedObjectIDs) == 0 {
+			return nil, nil, nil
+		}
+		banList = make([]byte, (len(s.idArray)+7)/8)
+		for idx, id := range s.idArray {
+			if _, ok := allowedObjectIDs[id]; !ok {
+				banList[idx/8] |= 1 << (idx % 8)
+			}
+		}
+	}
+	intIDs, floatScores, err := s.retriever.Search(q, topK, banList)
 	if err != nil || len(intIDs) == 0 {
 		return nil, nil, err
 	}

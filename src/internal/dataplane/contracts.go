@@ -22,9 +22,13 @@ type IngestRecord struct {
 // SearchInput is the query descriptor passed from the semantic layer to the
 // data plane.  All fields are optional; zero values mean "no constraint".
 type SearchInput struct {
-	QueryText      string
-	TopK           int
-	Namespace      string
+	QueryText string
+	TopK      int
+	Namespace string
+	// ScopeFilters constrain the retrieval candidate set before ranking and
+	// TopK selection. Keys correspond to canonical ingest attributes such as
+	// tenant_id, workspace_id, agent_id, and session_id.
+	ScopeFilters   map[string]string
 	Constraints    []string
 	TimeFromUnixTS int64
 	TimeToUnixTS   int64

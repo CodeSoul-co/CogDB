@@ -560,6 +560,42 @@ func (t *TieredObjectStore) ColdHNSWSearch(queryVec []float32, topK int) []strin
 	return nil
 }
 
+// ColdMemoryCount reports the cold candidate population used to over-fetch
+// scoped searches before the final TopK cut.
+func (t *TieredObjectStore) ColdMemoryCount() int {
+	if t == nil || t.cold == nil {
+		return 0
+	}
+	return len(t.cold.ListMemories())
+}
+
+// ColdMemoryMatchesScope checks canonical cold metadata without promoting the
+// memory. Scope filters use the same ingest-attribute names as SearchInput.
+func (t *TieredObjectStore) ColdMemoryMatchesScope(memoryID string, filters map[string]string) bool {
+	if t == nil || t.cold == nil {
+		return false
+	}
+	memory, ok := t.cold.GetMemory(memoryID)
+	if !ok {
+		return false
+	}
+	actual := map[string]string{
+		"tenant_id":    memory.TenantID,
+		"workspace_id": memory.WorkspaceID,
+		"agent_id":     memory.AgentID,
+		"session_id":   memory.SessionID,
+	}
+	if actual["workspace_id"] == "" {
+		actual["workspace_id"] = memory.Scope
+	}
+	for key, expected := range filters {
+		if actual[key] != expected {
+			return false
+		}
+	}
+	return true
+}
+
 // ArchiveColdRecord persists an ingest record directly to the cold tier.
 // This is called by TieredDataPlane when an object is explicitly archived
 // (e.g. on TTL expiry or manual tier migration) rather than through the

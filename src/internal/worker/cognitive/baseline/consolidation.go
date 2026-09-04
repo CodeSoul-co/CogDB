@@ -54,6 +54,10 @@ func (w *InMemoryMemoryConsolidationWorker) Info() nodes.NodeInfo {
 }
 
 func (w *InMemoryMemoryConsolidationWorker) Consolidate(agentID, sessionID string) error {
+	summaryID := schemas.IDPrefixSummary + agentID + "_" + sessionID
+	if existing, ok := w.store.GetMemory(summaryID); ok && existing.Level == 1 && existing.IsActive {
+		return nil
+	}
 	memories := w.store.ListMemories(agentID, sessionID)
 	if len(memories) == 0 {
 		return nil
@@ -69,7 +73,6 @@ func (w *InMemoryMemoryConsolidationWorker) Consolidate(agentID, sessionID strin
 	if len(sourceIDs) == 0 {
 		return nil
 	}
-	summaryID := schemas.IDPrefixSummary + agentID + "_" + sessionID
 	w.store.PutMemory(schemas.Memory{
 		MemoryID:       summaryID,
 		MemoryType:     string(schemas.MemoryTypeSemantic),

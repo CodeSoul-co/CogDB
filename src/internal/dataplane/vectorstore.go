@@ -259,6 +259,13 @@ func (vs *VectorStore) Snapshot() (ids []string, vectors []float32, dim int) {
 // Search queries the vector index and returns up to topK (objectID, score) pairs.
 // Thread-safe.
 func (vs *VectorStore) Search(queryVec []float32, topK int) (ids []string, scores []float32, err error) {
+	return vs.SearchFiltered(queryVec, topK, nil)
+}
+
+// SearchFiltered applies an object-ID allow-list inside ANN search, before
+// TopK is selected. A nil allow-list means unrestricted; an empty non-nil
+// allow-list matches no candidates.
+func (vs *VectorStore) SearchFiltered(queryVec []float32, topK int, allowedObjectIDs map[string]struct{}) (ids []string, scores []float32, err error) {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 
@@ -266,7 +273,20 @@ func (vs *VectorStore) Search(queryVec []float32, topK int) (ids []string, score
 		return nil, nil, nil
 	}
 
-	intIDs, floatScores, err := vs.retriever.Search(queryVec, topK, nil)
+	var allowList []byte
+	if allowedObjectIDs != nil {
+		if len(allowedObjectIDs) == 0 {
+			return nil, nil, nil
+		}
+		allowList = make([]byte, (len(vs.idArray)+7)/8)
+		for idx, id := range vs.idArray {
+			if _, ok := allowedObjectIDs[id]; ok {
+				allowList[idx/8] |= 1 << (idx % 8)
+			}
+		}
+	}
+
+	intIDs, floatScores, err := vs.retriever.Search(queryVec, topK, allowList)
 	if err != nil || len(intIDs) == 0 {
 		return nil, nil, err
 	}

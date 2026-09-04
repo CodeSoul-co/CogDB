@@ -56,6 +56,42 @@ func TestInMemoryWAL_Scan(t *testing.T) {
 	}
 }
 
+func TestInMemoryWAL_DoesNotRetainDuplicateTopLevelEmbeddingVector(t *testing.T) {
+	bus := NewInMemoryBus()
+	clock := NewHybridClock()
+	wal := NewInMemoryWAL(bus, clock)
+
+	entry, err := wal.Append(schemas.Event{
+		EventID:   "embedded-event",
+		EventType: "artifact",
+		Retrieval: schemas.EventRetrieval{
+			IndexText:       "embedded event",
+			HasEmbedding:    true,
+			EmbeddingVector: []float32{0.1, 0.2, 0.3},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Append: unexpected error: %v", err)
+	}
+	if len(entry.Event.EmbeddingVector) != 0 {
+		t.Fatalf("entry retained duplicate top-level embedding vector: %v", entry.Event.EmbeddingVector)
+	}
+	if got := entry.Event.Retrieval.EmbeddingVector; len(got) != 3 {
+		t.Fatalf("entry retrieval embedding vector length = %d, want 3", len(got))
+	}
+
+	scanned := wal.Scan(0)
+	if len(scanned) != 1 {
+		t.Fatalf("Scan(0) entries = %d, want 1", len(scanned))
+	}
+	if len(scanned[0].Event.EmbeddingVector) != 0 {
+		t.Fatalf("scan retained duplicate top-level embedding vector: %v", scanned[0].Event.EmbeddingVector)
+	}
+	if got := scanned[0].Event.Retrieval.EmbeddingVector; len(got) != 3 {
+		t.Fatalf("scan retrieval embedding vector length = %d, want 3", len(got))
+	}
+}
+
 func TestInMemoryBus_PubSub(t *testing.T) {
 	bus := NewInMemoryBus()
 	ch := bus.Subscribe("test.channel")

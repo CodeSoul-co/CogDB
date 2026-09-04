@@ -35,6 +35,8 @@ type TieredDataPlane struct {
 	coldSearch       func(query string, topK int) []string
 	coldVectorSearch func(queryVec []float32, topK int) []string
 	coldHNSWSearch   func(queryVec []float32, topK int) []string
+	coldMemoryCount  func() int
+	coldScopeMatch   func(memoryID string, filters map[string]string) bool
 	rrfK             int
 	tierMu           sync.RWMutex
 	hotEnabled       bool
@@ -78,7 +80,9 @@ func NewTieredDataPlaneWithConfig(tieredObjs *storage.TieredObjectStore, cfg sch
 		coldHNSWSearch: func(queryVec []float32, topK int) []string {
 			return objs.ColdHNSWSearch(queryVec, topK)
 		},
-		rrfK: normalizeTieredRRFK(cfg), hotEnabled: true, warmEnabled: true,
+		coldMemoryCount: objs.ColdMemoryCount,
+		coldScopeMatch:  objs.ColdMemoryMatchesScope,
+		rrfK:            normalizeTieredRRFK(cfg), hotEnabled: true, warmEnabled: true,
 		coldEnabled: true, hotLimit: 2000, hotObjects: make(map[string]struct{}),
 	}
 }
@@ -120,7 +124,9 @@ func NewTieredDataPlaneWithEmbedderAndConfig(tieredObjs *storage.TieredObjectSto
 		coldHNSWSearch: func(queryVec []float32, topK int) []string {
 			return tieredObjs.ColdHNSWSearch(queryVec, topK)
 		},
-		rrfK: normalizeTieredRRFK(cfg), hotEnabled: true, warmEnabled: true,
+		coldMemoryCount: tieredObjs.ColdMemoryCount,
+		coldScopeMatch:  tieredObjs.ColdMemoryMatchesScope,
+		rrfK:            normalizeTieredRRFK(cfg), hotEnabled: true, warmEnabled: true,
 		coldEnabled: true, hotLimit: 2000, hotObjects: make(map[string]struct{}),
 	}, nil
 }
@@ -340,16 +346,37 @@ func (t *TieredDataPlane) SearchWarmSegmentBatchObjectIDs(segmentID string, nq i
 }
 
 func (t *TieredDataPlane) resolveColdIDs(input SearchInput) ([]string, string, bool) {
+	coldTopK := input.TopK
+	if len(input.ScopeFilters) > 0 && t.coldMemoryCount != nil {
+		if candidateCount := t.coldMemoryCount(); candidateCount > coldTopK {
+			coldTopK = candidateCount
+		}
+	}
+	finish := func(ids []string) []string {
+		if len(input.ScopeFilters) > 0 && t.coldScopeMatch != nil {
+			filtered := make([]string, 0, len(ids))
+			for _, id := range ids {
+				if t.coldScopeMatch(id, input.ScopeFilters) {
+					filtered = append(filtered, id)
+				}
+			}
+			ids = filtered
+		}
+		if input.TopK > 0 && len(ids) > input.TopK {
+			ids = ids[:input.TopK]
+		}
+		return ids
+	}
 	// Use precomputed query embedding when provided (bypasses embedder).
 	if len(input.QueryEmbedding) > 0 {
 		if t.coldHNSWSearch != nil {
-			ids := t.coldHNSWSearch(input.QueryEmbedding, input.TopK)
+			ids := finish(t.coldHNSWSearch(input.QueryEmbedding, coldTopK))
 			if len(ids) > 0 {
 				return ids, "hnsw", false
 			}
 		}
 		if t.coldVectorSearch != nil {
-			ids := t.coldVectorSearch(input.QueryEmbedding, input.TopK)
+			ids := finish(t.coldVectorSearch(input.QueryEmbedding, coldTopK))
 			if len(ids) > 0 {
 				return ids, "vector", t.coldHNSWSearch != nil
 			}
@@ -360,13 +387,13 @@ func (t *TieredDataPlane) resolveColdIDs(input SearchInput) ([]string, string, b
 		queryVec, err := t.embedder.Generate(input.QueryText)
 		if err == nil && len(queryVec) > 0 {
 			if t.coldHNSWSearch != nil {
-				ids := t.coldHNSWSearch(queryVec, input.TopK)
+				ids := finish(t.coldHNSWSearch(queryVec, coldTopK))
 				if len(ids) > 0 {
 					return ids, "hnsw", false
 				}
 			}
 			if t.coldVectorSearch != nil {
-				ids := t.coldVectorSearch(queryVec, input.TopK)
+				ids := finish(t.coldVectorSearch(queryVec, coldTopK))
 				if len(ids) > 0 {
 					return ids, "vector", t.coldHNSWSearch != nil
 				}
@@ -374,7 +401,7 @@ func (t *TieredDataPlane) resolveColdIDs(input SearchInput) ([]string, string, b
 		}
 	}
 	if t.coldSearch != nil {
-		ids := t.coldSearch(input.QueryText, input.TopK)
+		ids := finish(t.coldSearch(input.QueryText, coldTopK))
 		if len(ids) > 0 {
 			return ids, "lexical", t.embedder != nil || t.coldVectorSearch != nil || t.coldHNSWSearch != nil
 		}
@@ -391,12 +418,13 @@ func (t *TieredDataPlane) Search(input SearchInput) SearchOutput {
 	hotResult := segmentstore.SearchResult{}
 	if hotEnabled {
 		hotResult = t.hot.Search(segmentstore.SearchRequest{
-			Query:          input.QueryText,
-			TopK:           input.TopK,
-			Namespace:      input.Namespace,
-			MinEventUnixTS: input.TimeFromUnixTS,
-			MaxEventUnixTS: input.TimeToUnixTS,
-			IncludeGrowing: true,
+			Query:            input.QueryText,
+			TopK:             input.TopK,
+			Namespace:        input.Namespace,
+			AttributeFilters: input.ScopeFilters,
+			MinEventUnixTS:   input.TimeFromUnixTS,
+			MaxEventUnixTS:   input.TimeToUnixTS,
+			IncludeGrowing:   true,
 		})
 	}
 

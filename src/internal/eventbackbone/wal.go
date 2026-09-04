@@ -31,6 +31,7 @@ func (w *InMemoryWAL) Append(event schemas.Event) (WALEntry, error) {
 	if event.Time.LogicalTS == 0 {
 		event.Time.LogicalTS = lsn
 	}
+	event.EmbeddingVector = nil
 	entry := WALEntry{LSN: lsn, AcceptedAtUnixNano: time.Now().UnixNano(), Event: event}
 	w.mu.Lock()
 	w.entries = append(w.entries, entry)

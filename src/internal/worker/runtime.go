@@ -38,6 +38,21 @@ var (
 	ErrShareForbidden = errors.New("share forbidden")
 )
 
+type runtimeSummaryObjectCounter interface {
+	CountEvents(agentID, sessionID string) int
+	CountMemories(agentID, sessionID string) int
+	CountStates(agentID, sessionID string) int
+	CountArtifacts(sessionID string) int
+}
+
+type runtimeSummaryEdgeCounter interface {
+	CountEdges() int
+}
+
+type runtimeSummaryVersionCounter interface {
+	CountVersions() int
+}
+
 type Runtime struct {
 	wal               eventbackbone.WAL
 	bus               eventbackbone.Bus
@@ -369,10 +384,17 @@ func (r *Runtime) ReindexEmbeddings() (int, error) {
 			namespace = "default"
 		}
 		records = append(records, dataplane.IngestRecord{
-			ObjectID:        memoryID,
-			Text:            text,
-			Namespace:       namespace,
-			Attributes:      map[string]string{"embedding_family": spec.Family},
+			ObjectID:  memoryID,
+			Text:      text,
+			Namespace: namespace,
+			Attributes: map[string]string{
+				"embedding_family": spec.Family,
+				"object_type":      string(schemas.ObjectTypeMemory),
+				"tenant_id":        memory.TenantID,
+				"workspace_id":     memory.WorkspaceID,
+				"agent_id":         memory.AgentID,
+				"session_id":       memory.SessionID,
+			},
 			EmbeddingFamily: spec.Family,
 			EmbeddingDim:    spec.Dim,
 		})
@@ -755,6 +777,7 @@ func (r *Runtime) executeQuery(req schemas.QueryRequest, readWatermarkLSN int64)
 		QueryText:      req.QueryText,
 		TopK:           plan.TopK,
 		Namespace:      plan.Namespace,
+		ScopeFilters:   queryScopeFilters(req),
 		Constraints:    plan.Constraints,
 		TimeFromUnixTS: plan.TimeFromUnixTS,
 		TimeToUnixTS:   plan.TimeToUnixTS,
@@ -774,9 +797,27 @@ func (r *Runtime) executeQuery(req schemas.QueryRequest, readWatermarkLSN int64)
 			}
 		}
 	}
+	result.ObjectIDs = semantic.FilterObjectIDsByTypes(result.ObjectIDs, plan.ObjectTypes)
+	result.ObjectIDs = r.filterObjectIDsByScopeSelectors(result.ObjectIDs, req)
+	if queryUsesStructuredMemorySelectors(req) {
+		selectorIDs := r.fetchMemoryIDsByStructuredSelectors(req)
+		if req.LatestBatchOnly {
+			result.ObjectIDs = selectorIDs
+		} else {
+			result.ObjectIDs = filterObjectIDsByStructuredSelectors(r.storage.Objects(), result.ObjectIDs, req)
+			result.ObjectIDs = appendMissing(result.ObjectIDs, selectorIDs)
+		}
+	}
 	promotionStarted := time.Now()
 	if r.tieredObjects != nil && r.capabilities.TierProfile != "no_promotion" {
+		selected := make(map[string]struct{}, len(result.ObjectIDs))
+		for _, objectID := range result.ObjectIDs {
+			selected[objectID] = struct{}{}
+		}
 		for _, objectID := range result.ColdObjectIDs {
+			if _, ok := selected[objectID]; !ok {
+				continue
+			}
 			memory, ok := r.tieredObjects.GetMemoryActivated(objectID, 1)
 			if !ok {
 				continue
@@ -787,21 +828,17 @@ func (r *Runtime) executeQuery(req schemas.QueryRequest, readWatermarkLSN int64)
 			}
 			_ = r.plane.Ingest(dataplane.IngestRecord{
 				ObjectID: objectID, Text: memory.Content, Namespace: namespace,
-				Attributes: map[string]string{"object_type": string(schemas.ObjectTypeMemory)},
+				Attributes: map[string]string{
+					"object_type":  string(schemas.ObjectTypeMemory),
+					"tenant_id":    memory.TenantID,
+					"workspace_id": memory.WorkspaceID,
+					"agent_id":     memory.AgentID,
+					"session_id":   memory.SessionID,
+				},
 			})
 		}
 	}
 	diagnostics.PromotionLatencyMS = durationMS(time.Since(promotionStarted))
-	result.ObjectIDs = semantic.FilterObjectIDsByTypes(result.ObjectIDs, plan.ObjectTypes)
-	if queryUsesStructuredMemorySelectors(req) {
-		selectorIDs := r.fetchMemoryIDsByStructuredSelectors(req)
-		if req.LatestBatchOnly {
-			result.ObjectIDs = selectorIDs
-		} else {
-			result.ObjectIDs = filterObjectIDsByStructuredSelectors(r.storage.Objects(), result.ObjectIDs, req)
-			result.ObjectIDs = appendMissing(result.ObjectIDs, selectorIDs)
-		}
-	}
 	result.ObjectIDs = appendMissing(result.ObjectIDs, r.fetchTargetObjectIDs(req))
 	result.ObjectIDs = r.filterObjectIDsForLifecycle(result.ObjectIDs, result.ColdObjectIDs)
 	policyStarted := time.Now()
@@ -1132,6 +1169,31 @@ func queryUsesStructuredMemorySelectors(req schemas.QueryRequest) bool {
 		req.LatestBatchOnly
 }
 
+func queryUsesScopeSelectors(req schemas.QueryRequest) bool {
+	return strings.TrimSpace(req.TenantID) != "" ||
+		strings.TrimSpace(req.WorkspaceID) != "" ||
+		strings.TrimSpace(req.AgentID) != "" ||
+		strings.TrimSpace(req.SessionID) != ""
+}
+
+func queryScopeFilters(req schemas.QueryRequest) map[string]string {
+	filters := make(map[string]string, 4)
+	for key, value := range map[string]string{
+		"tenant_id":    req.TenantID,
+		"workspace_id": req.WorkspaceID,
+		"agent_id":     req.AgentID,
+		"session_id":   req.SessionID,
+	} {
+		if value = strings.TrimSpace(value); value != "" {
+			filters[key] = value
+		}
+	}
+	if len(filters) == 0 {
+		return nil
+	}
+	return filters
+}
+
 func appendMissing(base []string, extras []string) []string {
 	if len(extras) == 0 {
 		return base
@@ -1160,13 +1222,58 @@ func filterObjectIDsByStructuredSelectors(os storage.ObjectStore, ids []string, 
 		if !ok {
 			continue
 		}
-		if !memoryMatchesStructuredSelectorsBase(mem, req) {
+		if !memoryMatchesQuerySelectors(mem, req) {
 			continue
 		}
 		if req.ImportBatchID != "" && mem.ImportBatchID != strings.TrimSpace(req.ImportBatchID) {
 			continue
 		}
 		out = append(out, id)
+	}
+	return out
+}
+
+func (r *Runtime) filterObjectIDsByScopeSelectors(ids []string, req schemas.QueryRequest) []string {
+	if len(ids) == 0 || !queryUsesScopeSelectors(req) {
+		return ids
+	}
+	out := make([]string, 0, len(ids))
+	var objects storage.ObjectStore
+	if r.storage != nil {
+		objects = r.storage.Objects()
+	}
+	for _, id := range ids {
+		if objects != nil {
+			if mem, ok := objects.GetMemory(id); ok {
+				if memoryMatchesScopeSelectors(mem, req) {
+					out = append(out, id)
+				}
+				continue
+			}
+			if st, ok := objects.GetState(id); ok {
+				if stateMatchesQuerySelectors(st, req) {
+					out = append(out, id)
+				}
+				continue
+			}
+			if art, ok := objects.GetArtifact(id); ok {
+				if artifactMatchesQuerySelectors(art, req) {
+					out = append(out, id)
+				}
+				continue
+			}
+			if ev, ok := objects.GetEvent(id); ok {
+				if eventMatchesQuerySelectors(ev.NormalizeDynamicEventV04(), req) {
+					out = append(out, id)
+				}
+				continue
+			}
+		}
+		if r.tieredObjects != nil {
+			if mem, ok := r.tieredObjects.PeekMemory(id); ok && memoryMatchesScopeSelectors(mem, req) {
+				out = append(out, id)
+			}
+		}
 	}
 	return out
 }
@@ -1181,7 +1288,7 @@ func (r *Runtime) fetchMemoryIDsByStructuredSelectors(req schemas.QueryRequest) 
 	}
 	matched := make([]schemas.Memory, 0, len(all))
 	for _, mem := range all {
-		if !memoryMatchesStructuredSelectorsBase(mem, req) {
+		if !memoryMatchesQuerySelectors(mem, req) {
 			continue
 		}
 		matched = append(matched, mem)
@@ -1245,7 +1352,7 @@ func (r *Runtime) fetchTargetObjectIDs(req schemas.QueryRequest) []string {
 			continue
 		}
 		if objects != nil {
-			if mem, ok := objects.GetMemory(id); ok && memoryMatchesStructuredSelectorsBase(mem, req) {
+			if mem, ok := objects.GetMemory(id); ok && memoryMatchesQuerySelectors(mem, req) {
 				out = append(out, id)
 				continue
 			}
@@ -1271,9 +1378,17 @@ func (r *Runtime) fetchTargetObjectIDs(req schemas.QueryRequest) []string {
 	return out
 }
 
-func memoryMatchesStructuredSelectorsBase(mem schemas.Memory, req schemas.QueryRequest) bool {
+func memoryMatchesScopeSelectors(mem schemas.Memory, req schemas.QueryRequest) bool {
+	tenantID := strings.TrimSpace(req.TenantID)
+	if tenantID != "" && mem.TenantID != tenantID {
+		return false
+	}
 	workspaceID := strings.TrimSpace(req.WorkspaceID)
-	if workspaceID != "" && mem.Scope != workspaceID {
+	actualWorkspaceID := mem.WorkspaceID
+	if actualWorkspaceID == "" {
+		actualWorkspaceID = mem.Scope
+	}
+	if workspaceID != "" && actualWorkspaceID != workspaceID {
 		return false
 	}
 	agentID := strings.TrimSpace(req.AgentID)
@@ -1284,6 +1399,10 @@ func memoryMatchesStructuredSelectorsBase(mem schemas.Memory, req schemas.QueryR
 	if sessionID != "" && mem.SessionID != sessionID {
 		return false
 	}
+	return true
+}
+
+func memoryMatchesStructuredSelectors(mem schemas.Memory, req schemas.QueryRequest) bool {
 	datasetName := strings.TrimSpace(req.DatasetName)
 	if datasetName != "" && mem.DatasetName != datasetName {
 		return false
@@ -1295,7 +1414,19 @@ func memoryMatchesStructuredSelectorsBase(mem schemas.Memory, req schemas.QueryR
 	return true
 }
 
+func memoryMatchesQuerySelectors(mem schemas.Memory, req schemas.QueryRequest) bool {
+	return memoryMatchesScopeSelectors(mem, req) && memoryMatchesStructuredSelectors(mem, req)
+}
+
 func stateMatchesQuerySelectors(st schemas.State, req schemas.QueryRequest) bool {
+	tenantID := strings.TrimSpace(req.TenantID)
+	if tenantID != "" && st.TenantID != "" && st.TenantID != tenantID {
+		return false
+	}
+	workspaceID := strings.TrimSpace(req.WorkspaceID)
+	if workspaceID != "" && st.WorkspaceID != "" && st.WorkspaceID != workspaceID {
+		return false
+	}
 	agentID := strings.TrimSpace(req.AgentID)
 	if agentID != "" && st.AgentID != agentID {
 		return false
@@ -1308,6 +1439,14 @@ func stateMatchesQuerySelectors(st schemas.State, req schemas.QueryRequest) bool
 }
 
 func artifactMatchesQuerySelectors(art schemas.Artifact, req schemas.QueryRequest) bool {
+	tenantID := strings.TrimSpace(req.TenantID)
+	if tenantID != "" && art.TenantID != "" && art.TenantID != tenantID {
+		return false
+	}
+	workspaceID := strings.TrimSpace(req.WorkspaceID)
+	if workspaceID != "" && art.WorkspaceID != "" && art.WorkspaceID != workspaceID {
+		return false
+	}
 	agentID := strings.TrimSpace(req.AgentID)
 	if agentID != "" && art.OwnerAgentID != "" && art.OwnerAgentID != agentID {
 		return false
@@ -1320,6 +1459,10 @@ func artifactMatchesQuerySelectors(art schemas.Artifact, req schemas.QueryReques
 }
 
 func eventMatchesQuerySelectors(ev schemas.Event, req schemas.QueryRequest) bool {
+	tenantID := strings.TrimSpace(req.TenantID)
+	if tenantID != "" && ev.Identity.TenantID != "" && ev.Identity.TenantID != tenantID {
+		return false
+	}
 	workspaceID := strings.TrimSpace(req.WorkspaceID)
 	if workspaceID != "" && ev.Identity.WorkspaceID != "" && ev.Identity.WorkspaceID != workspaceID {
 		return false
@@ -2109,27 +2252,50 @@ func (r *Runtime) RuntimeStateSummary() map[string]any {
 	if r == nil || r.storage == nil {
 		return map[string]any{}
 	}
-	events := r.storage.Objects().ListEvents("", "")
-	memories := r.storage.Objects().ListMemories("", "")
-	states := r.storage.Objects().ListStates("", "")
-	artifacts := r.storage.Objects().ListArtifacts("")
-	edges := r.storage.Edges().ListEdges()
+	objects := r.storage.Objects()
+	eventCount := 0
+	memoryCount := 0
+	stateCount := 0
+	artifactCount := 0
+	if counter, ok := objects.(runtimeSummaryObjectCounter); ok {
+		eventCount = counter.CountEvents("", "")
+		memoryCount = counter.CountMemories("", "")
+		stateCount = counter.CountStates("", "")
+		artifactCount = counter.CountArtifacts("")
+	} else {
+		eventCount = len(objects.ListEvents("", ""))
+		memoryCount = len(objects.ListMemories("", ""))
+		stateCount = len(objects.ListStates("", ""))
+		artifactCount = len(objects.ListArtifacts(""))
+	}
+
+	edgeCount := 0
+	if counter, ok := r.storage.Edges().(runtimeSummaryEdgeCounter); ok {
+		edgeCount = counter.CountEdges()
+	} else {
+		edgeCount = len(r.storage.Edges().ListEdges())
+	}
+
 	versionCount := 0
-	seen := make(map[string]struct{})
-	for _, event := range events {
-		seen[event.NormalizeDynamicEventV04().Identity.EventID] = struct{}{}
-	}
-	for _, memory := range memories {
-		seen[memory.MemoryID] = struct{}{}
-	}
-	for _, state := range states {
-		seen[state.StateID] = struct{}{}
-	}
-	for _, artifact := range artifacts {
-		seen[artifact.ArtifactID] = struct{}{}
-	}
-	for objectID := range seen {
-		versionCount += len(r.storage.Versions().GetVersions(objectID))
+	if counter, ok := r.storage.Versions().(runtimeSummaryVersionCounter); ok {
+		versionCount = counter.CountVersions()
+	} else {
+		seen := make(map[string]struct{})
+		for _, event := range objects.ListEvents("", "") {
+			seen[event.NormalizeDynamicEventV04().Identity.EventID] = struct{}{}
+		}
+		for _, memory := range objects.ListMemories("", "") {
+			seen[memory.MemoryID] = struct{}{}
+		}
+		for _, state := range objects.ListStates("", "") {
+			seen[state.StateID] = struct{}{}
+		}
+		for _, artifact := range objects.ListArtifacts("") {
+			seen[artifact.ArtifactID] = struct{}{}
+		}
+		for objectID := range seen {
+			versionCount += len(r.storage.Versions().GetVersions(objectID))
+		}
 	}
 	coldMemories := 0
 	if r.tieredObjects != nil {
@@ -2140,10 +2306,10 @@ func (r *Runtime) RuntimeStateSummary() map[string]any {
 		hotEntries = r.storage.HotCache().Len()
 	}
 	return map[string]any{
-		"events": len(events), "memories": len(memories), "states": len(states),
-		"artifacts": len(artifacts), "edges": len(edges), "versions": versionCount,
-		"objects":       len(events) + len(memories) + len(states) + len(artifacts),
-		"latest_states": len(states), "hot_entries": hotEntries, "cold_memories": coldMemories,
+		"events": eventCount, "memories": memoryCount, "states": stateCount,
+		"artifacts": artifactCount, "edges": edgeCount, "versions": versionCount,
+		"objects":       eventCount + memoryCount + stateCount + artifactCount,
+		"latest_states": stateCount, "hot_entries": hotEntries, "cold_memories": coldMemories,
 		"latest_lsn": r.wal.LatestLSN(), "visible_watermark": r.ConsistencyStatus().VisibleWatermark,
 	}
 }

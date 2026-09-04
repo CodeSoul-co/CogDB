@@ -47,6 +47,33 @@ func buildSubscriberRuntime(t *testing.T) (
 	return wal, m, store, plog
 }
 
+type scanCountingWAL struct {
+	entries   []eventbackbone.WALEntry
+	scanCalls int
+}
+
+func (w *scanCountingWAL) Append(event schemas.Event) (eventbackbone.WALEntry, error) {
+	return eventbackbone.WALEntry{}, fmt.Errorf("append not implemented")
+}
+
+func (w *scanCountingWAL) Scan(fromLSN int64) []eventbackbone.WALEntry {
+	w.scanCalls++
+	out := make([]eventbackbone.WALEntry, 0)
+	for _, entry := range w.entries {
+		if entry.LSN >= fromLSN {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+func (w *scanCountingWAL) LatestLSN() int64 {
+	if len(w.entries) == 0 {
+		return 0
+	}
+	return w.entries[len(w.entries)-1].LSN
+}
+
 // TestEventSubscriber_DrainWAL checks that the subscriber processes all WAL
 // entries that were written before it started.
 func TestEventSubscriber_DrainWAL(t *testing.T) {
@@ -198,6 +225,38 @@ func TestEventSubscriber_VisibilityBoundaryBlocksUnprojectedEntries(t *testing.T
 	sub.drainWAL()
 	if called != 1 || sub.lastLSN.Load() != entry.LSN {
 		t.Fatalf("subscriber did not resume at visible boundary: called=%d last_lsn=%d", called, sub.lastLSN.Load())
+	}
+}
+
+func TestEventSubscriber_SkipsWALScanWhenVisibilityBoundaryHasNoNewEntries(t *testing.T) {
+	wal := &scanCountingWAL{
+		entries: []eventbackbone.WALEntry{
+			{LSN: 1, Event: schemas.Event{EventID: "evt-1"}},
+			{LSN: 2, Event: schemas.Event{EventID: "evt-2"}},
+		},
+	}
+	visibleLSN := int64(0)
+	called := 0
+	sub := CreateEventSubscriber(wal, nodes.CreateManager())
+	cfg := schemas.DefaultRuntimeCapabilities()
+	cfg.MaterializationProfile = "none"
+	sub.ConfigureCapabilities(cfg)
+	sub.SetVisibilityBoundary(func() int64 { return visibleLSN })
+	sub.AddHandler(func(eventbackbone.WALEntry) { called++ })
+
+	if err := sub.drainWAL(); err != nil {
+		t.Fatalf("drainWAL: %v", err)
+	}
+	if wal.scanCalls != 0 || called != 0 || sub.lastLSN.Load() != 0 {
+		t.Fatalf("scan before visible entries: scans=%d called=%d last_lsn=%d", wal.scanCalls, called, sub.lastLSN.Load())
+	}
+
+	visibleLSN = 1
+	if err := sub.drainWAL(); err != nil {
+		t.Fatalf("drainWAL after visibility advance: %v", err)
+	}
+	if wal.scanCalls != 1 || called != 1 || sub.lastLSN.Load() != 1 {
+		t.Fatalf("drain after visibility advance: scans=%d called=%d last_lsn=%d", wal.scanCalls, called, sub.lastLSN.Load())
 	}
 }
 
