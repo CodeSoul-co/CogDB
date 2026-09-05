@@ -335,18 +335,30 @@ make dev
 
 The server listens on `127.0.0.1:19530` by default. Override with `PLASMOD_HTTP_ADDR` environment variable.
 
+## Editions and Architecture
+
+| Edition | Availability | Description |
+|---------|--------------|-------------|
+| **Plasmod Open Source** | Available now | The community edition in this repository. Parts of its foundational module structure are derived from the open-source architecture of [Milvus](https://github.com/milvus-io/milvus). |
+| **Plasmod Cloud** | Coming soon | A fully independently developed, cloud-based commercial edition designed for managed production workloads. |
+
 ## License
 
-Plasmod is licensed under the [MIT License](LICENSE).
+The Plasmod open-source edition is licensed under the [MIT License](LICENSE).
+
+## Contact
+
+For project and commercial inquiries, contact [duanzhenke@code-soul.com](mailto:duanzhenke@code-soul.com).
 
 ---
 
-<div align="center">
+<p align="center">
+  <strong>Agent-native memory infrastructure for AI applications and multi-agent systems.</strong>
+</p>
 
-**[GitHub](https://github.com/CodeSoul-co/Plasmod)** · **[Python SDK](https://github.com/CodeSoul-co/pyplasmod)** · **[Docker Hub](https://hub.docker.com/r/oneflybird/plasmod)** · **[Issues](https://github.com/CodeSoul-co/Plasmod/issues)**
-
-## Contact us
-
-Email:duanzhenke@code-soul.com 
-
-</div>
+<p align="center">
+  <a href="https://github.com/CodeSoul-co/Plasmod"><strong>GitHub</strong></a> ·
+  <a href="https://github.com/CodeSoul-co/pyplasmod"><strong>Python SDK</strong></a> ·
+  <a href="https://hub.docker.com/r/oneflybird/plasmod"><strong>Docker Hub</strong></a> ·
+  <a href="https://github.com/CodeSoul-co/Plasmod/issues"><strong>Issues</strong></a>
+</p>
