@@ -325,14 +325,26 @@ make dev
 
 服务默认监听 `127.0.0.1:19530`。可通过 `PLASMOD_HTTP_ADDR` 环境变量覆盖。
 
+## 版本与架构说明
+
+| 版本 | 状态 | 说明 |
+|------|------|------|
+| **Plasmod 开源版** | 已发布 | 即本仓库提供的社区版本，其中部分基础模块的结构来源于 [Milvus](https://github.com/milvus-io/milvus) 的开源架构。 |
+| **Plasmod Cloud** | 即将推出 | 面向托管式生产工作负载、完全自主研发的云端商业版本。 |
+
 ## 许可证
 
-Plasmod 基于 [MIT 许可证](LICENSE) 发布。
+Plasmod 开源版基于 [MIT 许可证](LICENSE) 发布。
 
 ---
 
-<div align="center">
+<p align="center">
+  <strong>面向 AI 应用与多智能体系统的 Agent 原生记忆基础设施。</strong>
+</p>
 
-**[GitHub](https://github.com/CodeSoul-co/Plasmod)** · **[Python SDK](https://github.com/CodeSoul-co/pyplasmod)** · **[Docker Hub](https://hub.docker.com/r/oneflybird/plasmod)** · **[Issues](https://github.com/CodeSoul-co/Plasmod/issues)**
-
-</div>
+<p align="center">
+  <a href="https://github.com/CodeSoul-co/Plasmod"><strong>GitHub</strong></a> ·
+  <a href="https://github.com/CodeSoul-co/pyplasmod"><strong>Python SDK</strong></a> ·
+  <a href="https://hub.docker.com/r/oneflybird/plasmod"><strong>Docker Hub</strong></a> ·
+  <a href="https://github.com/CodeSoul-co/Plasmod/issues"><strong>Issues</strong></a>
+</p>
